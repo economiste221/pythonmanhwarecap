@@ -148,7 +148,10 @@ def merge_boxes(boxes, contain_thr: float = 0.5):
     return [tuple(b) for b in boxes]
 
 
-def draw_preview(strip: Image.Image, boxes, width: int = 500) -> Image.Image:
+def draw_preview(strip: Image.Image, boxes, width: int = 500,
+                 part_h: int = 8000) -> list[Image.Image]:
+    """Aperçu réduit avec cadres verts, découpé en morceaux de part_h px max
+    (le JPEG est limité à 65 535 px de haut : une bande de chapitre le dépasse vite)."""
     scale = width / strip.width
     prev = strip.resize((width, max(1, int(strip.height * scale))), Image.BILINEAR)
     d = ImageDraw.Draw(prev)
@@ -157,7 +160,8 @@ def draw_preview(strip: Image.Image, boxes, width: int = 500) -> Image.Image:
         d.rectangle(r, outline=(0, 220, 0), width=4)
         d.rectangle([r[0], r[1], r[0] + 34, r[1] + 22], fill=(0, 220, 0))
         d.text((r[0] + 5, r[1] + 5), str(i), fill="white")
-    return prev
+    return [prev.crop((0, y, width, min(y + part_h, prev.height)))
+            for y in range(0, prev.height, part_h)]
 
 
 # ───────────────────────── traitement complet ─────────────────────────
@@ -190,10 +194,11 @@ def run(files, conf, imgsz, tile_ratio, overlap, min_side, padding, keep_strip,
             manifest.append({"panel": path.name, "bbox": list(box)})
             gallery.append((str(path), f"{name} #{i}"))
 
-        prev = draw_preview(strip, boxes)
-        prev_path = ch_dir / "_apercu.jpg"
-        prev.save(prev_path, quality=85)
-        previews.append((str(prev_path), name))
+        parts = draw_preview(strip, boxes)
+        for k, part in enumerate(parts, 1):
+            prev_path = ch_dir / f"_apercu_{k:02d}.jpg"
+            part.save(prev_path, quality=85)
+            previews.append((str(prev_path), f"{name} ({k}/{len(parts)})"))
         if keep_strip:
             strip.save(ch_dir / "_bande_complete.png")
         (ch_dir / "panels.json").write_text(json.dumps(
@@ -204,6 +209,18 @@ def run(files, conf, imgsz, tile_ratio, overlap, min_side, padding, keep_strip,
 
     zip_path = shutil.make_archive(str(work / "panneaux_manhwa"), "zip", out_root)
     return gallery, previews, zip_path, "\n\n".join(report) + f"\n\n_Device : {DEVICE}_"
+
+
+def run_safe(*args, progress=gr.Progress()):
+    """Affiche la vraie cause d'une erreur dans l'interface (et la trace dans Colab)."""
+    try:
+        return run(*args, progress=progress)
+    except gr.Error:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise gr.Error(f"{type(e).__name__} : {e}") from e
 
 
 with gr.Blocks(title="Découpeur de panneaux manhwa") as demo:
@@ -230,7 +247,7 @@ with gr.Blocks(title="Découpeur de panneaux manhwa") as demo:
         with gr.Column(scale=2):
             gallery = gr.Gallery(label="Panneaux", columns=4, height=600)
             previews = gr.Gallery(label="Aperçu de la bande (cadres verts)", columns=3, height=600)
-    btn.click(run, [files, conf, imgsz, tile_ratio, overlap, min_side, padding, keep_strip],
+    btn.click(run_safe, [files, conf, imgsz, tile_ratio, overlap, min_side, padding, keep_strip],
               [gallery, previews, zip_out, report])
 
 if __name__ == "__main__":
