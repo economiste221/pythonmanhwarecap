@@ -37,6 +37,9 @@ class Worker(QThread):
         self.out_root = out_root
         self.settings = settings
         self._stop = False
+        # Sur macOS un QThread n'a que 512 Ko de pile : torch/YOLO la dépassent
+        # ("RecursionError: Stack overflow"). On lui en donne 64 Mo.
+        self.setStackSize(64 * 1024 * 1024)
 
     def stop(self):
         self._stop = True
