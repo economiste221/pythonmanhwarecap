@@ -16,11 +16,11 @@ import json
 import re
 import urllib.request
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 Image.MAX_IMAGE_PIXELS = None  # bandes webtoon très hautes
 
@@ -97,7 +97,8 @@ def _images_in(folder: Path, recursive: bool) -> list[Path]:
 
 
 def chapters_from_folder(folder: Path) -> dict[str, list[Path]]:
-    """Dossier d'images = 1 chapitre ; dossier de sous-dossiers = 1 chapitre par sous-dossier."""
+    """Dossier d'images = 1 chapitre ; dossier de sous-dossiers = 1 chapitre par sous-dossier.
+    Le nom du chapitre est le nom du (sous-)dossier, ex. ch0001 — c'est la clé du JSON."""
     chapters = {}
     direct = _images_in(folder, recursive=False)
     if direct:
@@ -105,7 +106,7 @@ def chapters_from_folder(folder: Path) -> dict[str, list[Path]]:
     for sub in sorted((d for d in folder.iterdir() if d.is_dir()), key=lambda d: natural_key(d.name)):
         imgs = _images_in(sub, recursive=True)
         if imgs:
-            chapters[f"{folder.name}/{sub.name}"] = imgs
+            chapters[sub.name] = imgs
     return chapters
 
 
@@ -116,7 +117,7 @@ def chapters_from_zip(zip_path: Path, extract_root: Path) -> dict[str, list[Path
     chapters: dict[str, list[Path]] = {}
     for img in _images_in(dest, recursive=True):
         rel = img.parent.relative_to(dest)
-        name = zip_path.stem if str(rel) == "." else f"{zip_path.stem}/{rel.as_posix()}"
+        name = zip_path.stem if str(rel) == "." else rel.name
         chapters.setdefault(name, []).append(img)
     return chapters
 
@@ -201,65 +202,74 @@ def merge_boxes(boxes: list[Box], contain_thr: float = 0.5) -> list[Box]:
     return [tuple(b) for b in work]
 
 
-def draw_preview(strip: Image.Image, boxes: list[Box], width: int = 500,
-                 part_h: int = 8000) -> list[Image.Image]:
-    """Aperçu réduit avec cadres verts, en morceaux de part_h px max
-    (le JPEG est limité à 65 535 px de haut)."""
-    width = min(width, strip.width)
-    scale = width / strip.width
-    prev = strip.resize((width, max(1, int(strip.height * scale))), Image.BILINEAR)
-    d = ImageDraw.Draw(prev)
-    for i, (x1, y1, x2, y2) in enumerate(boxes, 1):
-        r = [x1 * scale, y1 * scale, x2 * scale - 1, y2 * scale - 1]
-        d.rectangle(r, outline=(0, 220, 0), width=4)
-        d.rectangle([r[0], r[1], r[0] + 34, r[1] + 22], fill=(0, 220, 0))
-        d.text((r[0] + 5, r[1] + 5), str(i), fill="white")
-    return [prev.crop((0, y, width, min(y + part_h, prev.height)))
-            for y in range(0, prev.height, part_h)]
-
-
 def safe_name(name: str) -> str:
+    """Clé de chapitre utilisée dans strip_data.json et comme nom de dossier."""
     return re.sub(r"[^\w\-]+", "_", name).strip("_") or "chapitre"
 
 
-def process_chapter(model, device: str, name: str, pages: list[Path], out_root: Path,
-                    s: Settings, on_step: Callable[[str], None] = lambda m: None,
-                    on_tile: Callable[[int, int], None] | None = None) -> dict:
-    """Fusion + détection + export d'un chapitre. Retourne un résumé."""
+def to_xywh(boxes: list[Box]) -> list[list[int]]:
+    return [[int(x1), int(y1), int(x2 - x1), int(y2 - y1)] for x1, y1, x2, y2 in boxes]
+
+
+def sort_boxes(boxes: list[list[int]]) -> list[list[int]]:
+    """Ordre de lecture : haut -> bas, puis gauche -> droite."""
+    return sorted((list(map(int, b)) for b in boxes), key=lambda b: (b[1], b[0]))
+
+
+# ───────────────────────── strip_data.json ─────────────────────────
+# Format : {"ch0001": [[x, y, largeur, hauteur], ...], ...}
+# coordonnées en pixels dans la bande fusionnée du chapitre.
+
+def load_strip_data(path: Path) -> dict[str, list[list[int]]]:
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {k: sort_boxes(v) for k, v in data.items()}
+
+
+def save_strip_data(path: Path, data: dict[str, list[list[int]]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ordered = {k: sort_boxes(data[k]) for k in sorted(data, key=natural_key)}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(ordered, indent=4), encoding="utf-8")
+    tmp.replace(path)
+
+
+# ───────────────────────── traitement d'un chapitre ─────────────────────────
+
+def detect_chapter(model, device: str, name: str, pages: list[Path], s: Settings,
+                   on_step: Callable[[str], None] = lambda m: None,
+                   on_tile: Callable[[int, int], None] | None = None):
+    """Fusion + détection. Retourne (bande, boîtes [x, y, w, h])."""
     pages = sort_pages(pages)
     on_step(f"{name} : fusion de {len(pages)} pages…")
     strip = stitch(pages)
     on_step(f"{name} : détection ({strip.width}×{strip.height}px)…")
-    boxes = detect_strip(model, strip, s, device, on_tile)
+    return strip, to_xywh(detect_strip(model, strip, s, device, on_tile))
 
+
+def export_chapter(strip: Image.Image, boxes: list[list[int]], name: str, pages: list[Path],
+                   out_root: Path, padding: int = 0, keep_strip: bool = False) -> list[Path]:
+    """Écrit panel_0001.png… (ordre de lecture) + panels.json dans out_root/<clé>/."""
     ch_dir = out_root / safe_name(name)
     ch_dir.mkdir(parents=True, exist_ok=True)
-    for old in ch_dir.glob("panel_*.png"):
-        old.unlink()
-    for old in ch_dir.glob("_apercu_*.jpg"):
+    for old in list(ch_dir.glob("panel_*.png")) + list(ch_dir.glob("_apercu_*.jpg")):
         old.unlink()
 
-    on_step(f"{name} : export de {len(boxes)} panneaux…")
     panels, manifest = [], []
-    for i, (x1, y1, x2, y2) in enumerate(boxes, 1):
-        box = (max(0, x1 - s.padding), max(0, y1 - s.padding),
-               min(strip.width, x2 + s.padding), min(strip.height, y2 + s.padding))
+    for i, (x, y, w, h) in enumerate(sort_boxes(boxes), 1):
+        box = (max(0, x - padding), max(0, y - padding),
+               min(strip.width, x + w + padding), min(strip.height, y + h + padding))
+        if box[2] <= box[0] or box[3] <= box[1]:
+            continue
         path = ch_dir / f"panel_{i:04d}.png"
         strip.crop(box).save(path)
         panels.append(path)
-        manifest.append({"panel": path.name, "bbox": list(box)})
-
-    previews = []
-    for k, part in enumerate(draw_preview(strip, boxes), 1):
-        p = ch_dir / f"_apercu_{k:02d}.jpg"
-        part.save(p, quality=85)
-        previews.append(p)
-    if s.keep_strip:
+        manifest.append({"panel": path.name, "bbox_xywh": [x, y, w, h]})
+    if keep_strip:
         strip.save(ch_dir / "_bande_complete.png")
-
     (ch_dir / "panels.json").write_text(json.dumps(
-        {"chapitre": name, "pages": [p.name for p in pages], "taille_bande": list(strip.size),
-         "reglages": asdict(s), "panneaux": manifest}, indent=2, ensure_ascii=False),
+        {"chapitre": name, "cle": safe_name(name), "pages": [p.name for p in sort_pages(pages)],
+         "taille_bande": list(strip.size), "panneaux": manifest}, indent=2, ensure_ascii=False),
         encoding="utf-8")
-    return {"name": name, "dir": ch_dir, "pages": len(pages), "size": strip.size,
-            "panels": panels, "previews": previews}
+    return panels
