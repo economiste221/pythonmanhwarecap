@@ -1,3 +1,5 @@
 opencv-python-headless
 numpy
 Pillow
+# pour decoupe_yolo.py (modèles Aniflow)
+ultralytics
